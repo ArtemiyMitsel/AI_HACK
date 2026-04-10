@@ -14,7 +14,7 @@ from src.utils.baseline import make_agent_submission
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
 
-
+   
 def build_gigachat(config: dict[str, Any] | None = None) -> GigaChat:
     config = config or {}
     gc_cfg = config.get("gigachat", {})
