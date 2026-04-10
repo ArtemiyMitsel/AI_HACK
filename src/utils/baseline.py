@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -17,15 +19,18 @@ from sklearn.model_selection import StratifiedKFold
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
 MAX_FEATURES = 5
-MAX_ATTEMPTS = 4
-MAX_LLM_ATTEMPTS = 2
-MAX_LLM_FEATURES_PER_ATTEMPT = 8
+MAX_ATTEMPTS = 10
+MAX_LLM_ATTEMPTS = 3
+MAX_LLM_FEATURES_PER_ATTEMPT = 10
 CV_FOLDS = 3
 RANDOM_STATE = 42
 EVAL_SAMPLE_ROWS = 20_000
+POOL_EVAL_SAMPLE_ROWS = 15_000
+POOL_MAX_FEATURES = 40
+COMPOSITE_KEY_OVERLAP_MIN = 0.5
 
 MODEL_PARAMS = {
-    "iterations": 200,
+    "iterations": 300,
     "learning_rate": 0.05,
     "depth": 6,
     "l2_leaf_reg": 3,
@@ -40,6 +45,11 @@ SUPPORTED_AGGS = {"count", "nunique", "sum", "mean", "min", "max", "std", "media
 SUPPORTED_BINARY_OPS = {"divide", "subtract", "add"}
 
 
+def _is_string_or_object_dtype(series: pd.Series) -> bool:
+    """Check if a Series has string-like dtype (works on both pandas 2.x and 3.x)."""
+    return pd.api.types.is_string_dtype(series) and not pd.api.types.is_numeric_dtype(series)
+
+
 @dataclass
 class AttemptResult:
     name: str
@@ -48,6 +58,8 @@ class AttemptResult:
     cv_auc: float
     selected_features: list[str]
     importances: dict[str, float]
+    train_pool: pd.DataFrame = field(default_factory=pd.DataFrame)
+    test_pool: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -150,10 +162,15 @@ def infer_id_column(train_df: pd.DataFrame, test_df: pd.DataFrame, target_column
 
 
 def build_table_profiles(
-    tables: dict[str, pd.DataFrame], base_ids: pd.Series, id_column: str, target_column: str
+    tables: dict[str, pd.DataFrame],
+    base_ids: pd.Series,
+    id_column: str,
+    target_column: str,
+    base_keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     profiles: list[dict[str, Any]] = []
     base_id_sample = set(base_ids.dropna().astype(str).head(1000))
+    base_keys = base_keys or []
     for name, df in tables.items():
         columns: list[dict[str, Any]] = []
         for col in df.columns[:30]:
@@ -164,7 +181,7 @@ def build_table_profiles(
                 "nunique": int(series.nunique(dropna=True)),
                 "missing": int(series.isna().sum()),
             }
-            if series.dtype == "object":
+            if _is_string_or_object_dtype(series):
                 values = series.dropna().astype(str).head(3).tolist()
                 if values:
                     col_profile["examples"] = values
@@ -178,6 +195,10 @@ def build_table_profiles(
             overlap = len(base_id_sample & set(df[col].dropna().astype(str).head(1000)))
             if overlap >= 20:
                 possible_keys.append(col)
+        is_prejoin = name.startswith("__prejoin__")
+        composite_grain: list[str] = []
+        if is_prejoin and base_keys:
+            composite_grain = [bk for bk in base_keys if bk in df.columns]
         profiles.append(
             {
                 "table": name,
@@ -186,6 +207,8 @@ def build_table_profiles(
                 "possible_join_keys": possible_keys[:5],
                 "is_base": name in {"train.csv", "test.csv"},
                 "target_column": target_column if name == "train.csv" else None,
+                "kind": "prejoin" if is_prejoin else "regular",
+                "composite_grain": composite_grain,
             }
         )
     return profiles
@@ -215,11 +238,20 @@ def llm_generate_attempts(
     base_ids: pd.Series,
     id_column: str,
     target_column: str,
+    base_keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     if gigachat is None:
         return []
 
-    profiles = build_table_profiles(tables, base_ids, id_column, target_column)
+    profiles = build_table_profiles(tables, base_ids, id_column, target_column, base_keys=base_keys)
+    composite_hint = ""
+    if base_keys and len(base_keys) >= 2:
+        composite_hint = (
+            f"\nВ базовой таблице обнаружены составные ключи связи: {base_keys}. "
+            f"Если в профилях есть таблицы `__prejoin__*` с `composite_grain`, содержащим эти ключи, "
+            f"стройте признаки на уровне пары этих ключей через `group_keys`/`base_keys` — "
+            f"такие признаки обычно сильнее, чем признаки уровня одного ключа.\n"
+        )
     prompt = f"""
 Ты проектируешь только кандидаты табличных признаков для бинарной классификации.
 
@@ -231,7 +263,7 @@ def llm_generate_attempts(
 - Используй только таблицы и колонки, перечисленные ниже.
 - Если таблица не нужна, игнорируй ее.
 - Отдавай только JSON без пояснений.
-
+{composite_hint}
 Поддерживаемый DSL:
 Каждая попытка должна содержать от {MAX_FEATURES} до {MAX_LLM_FEATURES_PER_ATTEMPT} кандидатов, отсортированных от самых сильных к самым слабым.
 Исполнитель попытается материализовать кандидаты по порядку, отберет до {MAX_FEATURES} лучших валидных признаков и при необходимости автоматически дополнит попытку.
@@ -250,7 +282,7 @@ LLM сам решает, сколько из них:
   "column": "user_id"
 }}
 
-2. aggregate:
+2. aggregate по одному ключу:
 {{
   "name": "payments_mean_amount",
   "kind": "aggregate",
@@ -271,16 +303,29 @@ LLM сам решает, сколько из них:
   "right": "payments_count"
 }}
 
+4. aggregate с составной группировкой (для пары ключей в pre-joined таблицах):
+{{
+  "name": "pair_reorder_ratio",
+  "kind": "aggregate",
+  "table": "__prejoin__orders__order_items",
+  "group_keys": ["user_id", "product_id"],
+  "base_keys": ["user_id", "product_id"],
+  "value_column": "reordered",
+  "agg": "mean",
+  "filters": []
+}}
+
 Разрешенные агрегации: {sorted(SUPPORTED_AGGS)}
 Разрешенные операции: {sorted(SUPPORTED_BINARY_OPS)}
-Не придумывай сложные join-цепочки, только агрегации по одному ключу до базовой таблицы.
+Используй `group_keys`/`base_keys` только для таблиц `__prejoin__*` с заполненным `composite_grain`.
+В остальных случаях используй одноключевые агрегации `group_key`/`base_key`.
 Если полезно, можешь не создавать новые признаки, а выбрать часть уже существующих полей базовой таблицы.
 
 Описание данных:
 {readme_text[:7000]}
 
 Профили таблиц:
-{json.dumps(profiles, ensure_ascii=False, indent=2)[:15000]}
+{json.dumps(profiles, ensure_ascii=False, indent=2)[:20000]}
 
 Верни JSON формата:
 {{
@@ -413,6 +458,61 @@ def choose_join_columns(
     return best_pair if best_pair and best_score > 0 else (None, None)
 
 
+def _as_key_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value if isinstance(v, (str, int))]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def resolve_group_keys(
+    spec: dict[str, Any],
+    table_df: pd.DataFrame,
+    base_frame: pd.DataFrame,
+    base_ids: pd.Series,
+    id_column: str,
+) -> tuple[list[str], list[str]] | None:
+    """Normalize legacy (group_key/base_key) and new (group_keys/base_keys) spec forms."""
+    group_keys_spec = _as_key_list(spec.get("group_keys"))
+    base_keys_spec = _as_key_list(spec.get("base_keys"))
+
+    if group_keys_spec:
+        resolved_group: list[str] = []
+        for hint in group_keys_spec:
+            resolved = choose_table_join_key(base_ids, table_df, hint, id_column)
+            if not resolved or resolved not in table_df.columns:
+                return None
+            resolved_group.append(resolved)
+
+        if base_keys_spec and len(base_keys_spec) == len(resolved_group):
+            resolved_base: list[str] = []
+            for hint, gkey in zip(base_keys_spec, resolved_group, strict=False):
+                resolved = choose_base_join_key(base_frame, gkey, hint, id_column)
+                if not resolved or resolved not in base_frame.columns:
+                    return None
+                resolved_base.append(resolved)
+        else:
+            resolved_base = []
+            for gkey in resolved_group:
+                resolved = choose_base_join_key(base_frame, gkey, None, id_column)
+                if not resolved or resolved not in base_frame.columns:
+                    return None
+                resolved_base.append(resolved)
+
+        if len(set(resolved_group)) != len(resolved_group) or len(set(resolved_base)) != len(resolved_base):
+            return None
+        return resolved_group, resolved_base
+
+    group_key = choose_table_join_key(base_ids, table_df, spec.get("group_key"), id_column)
+    if not group_key or group_key not in table_df.columns:
+        return None
+    base_key = choose_base_join_key(base_frame, group_key, spec.get("base_key"), id_column)
+    if not base_key or base_key not in base_frame.columns:
+        return None
+    return [group_key], [base_key]
+
+
 def build_aggregate_feature(
     base_frame: pd.DataFrame,
     tables: dict[str, pd.DataFrame],
@@ -429,14 +529,11 @@ def build_aggregate_feature(
         return None
 
     table_df = tables[table_name].copy()
-    group_key = choose_table_join_key(base_ids, table_df, spec.get("group_key"), id_column)
-    if not group_key or group_key not in table_df.columns:
-        logger.warning("Пропускаем aggregate feature, не найден group_key: {}", spec)
+    resolved = resolve_group_keys(spec, table_df, base_frame, base_ids, id_column)
+    if resolved is None:
+        logger.warning("Пропускаем aggregate feature, не найдены ключи: {}", spec)
         return None
-    base_key = choose_base_join_key(base_frame, group_key, spec.get("base_key"), id_column)
-    if not base_key or base_key not in base_frame.columns:
-        logger.warning("Пропускаем aggregate feature, не найден base_key: {}", spec)
-        return None
+    group_keys, base_keys = resolved
 
     filters = spec.get("filters", [])
     if isinstance(filters, list) and filters:
@@ -448,36 +545,55 @@ def build_aggregate_feature(
         return None
 
     value_column = spec.get("value_column")
-    grouped: pd.Series
+    single_key = len(group_keys) == 1
+
     if agg == "count":
-        grouped = table_df.groupby(group_key, dropna=False).size()
+        if single_key:
+            grouped = table_df.groupby(group_keys[0], dropna=False).size()
+            return base_frame[base_keys[0]].map(grouped).reset_index(drop=True)
+        out_col = "__agg_value__"
+        grouped_df = (
+            table_df.groupby(group_keys, dropna=False)
+            .size()
+            .reset_index(name=out_col)
+        )
     else:
-        if value_column not in table_df.columns:
+        if not isinstance(value_column, str) or value_column not in table_df.columns:
             logger.warning("Пропускаем aggregate feature, value_column не найден: {}", spec)
             return None
         series = table_df[value_column]
         if agg in {"sum", "mean", "min", "max", "std", "median"}:
             series = pd.to_numeric(series, errors="coerce")
-        grouped_source = pd.DataFrame({group_key: table_df[group_key], value_column: series})
+        keys_df = table_df[group_keys]
+        grouped_source = pd.concat([keys_df.reset_index(drop=True), series.reset_index(drop=True).rename(value_column)], axis=1)
         if agg == "nunique":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].nunique()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].nunique()
         elif agg == "first":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].first()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].first()
         elif agg == "sum":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].sum()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].sum()
         elif agg == "mean":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].mean()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].mean()
         elif agg == "min":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].min()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].min()
         elif agg == "max":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].max()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].max()
         elif agg == "std":
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].std()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].std()
         else:
-            grouped = grouped_source.groupby(group_key, dropna=False)[value_column].median()
+            grouped_obj = grouped_source.groupby(group_keys, dropna=False)[value_column].median()
 
-    result = base_frame[base_key].map(grouped)
-    return result
+        if single_key:
+            return base_frame[base_keys[0]].map(grouped_obj).reset_index(drop=True)
+        out_col = "__agg_value__"
+        grouped_df = grouped_obj.reset_index().rename(columns={value_column: out_col})
+
+    rename_map = dict(zip(group_keys, base_keys, strict=False))
+    merge_right = grouped_df.rename(columns=rename_map)
+    merged = base_frame[base_keys].reset_index(drop=True).merge(
+        merge_right, how="left", on=base_keys
+    )
+    return merged[out_col].reset_index(drop=True)
 
 
 def build_binary_feature(feature_frame: pd.DataFrame, spec: dict[str, Any]) -> pd.Series | None:
@@ -629,6 +745,182 @@ def build_fallback_row_features(
     return enrich(train_df), enrich(test_df)
 
 
+def detect_base_join_keys(
+    base_df: pd.DataFrame,
+    tables: dict[str, pd.DataFrame],
+    id_column: str,
+    target_column: str,
+) -> list[str]:
+    """Detect which non-id columns in the base table look like join keys into related tables."""
+    candidate_scores: dict[str, float] = {}
+    base_cols = [c for c in base_df.columns if c not in {id_column, target_column}]
+    for col in base_cols:
+        base_vals = set(base_df[col].dropna().astype(str).head(5000))
+        if len(base_vals) < 20:
+            continue
+        base_variants = candidate_key_names(col)
+        best_ratio = 0.0
+        for tname, tdf in tables.items():
+            if tname in {"train.csv", "test.csv"}:
+                continue
+            for tcol in tdf.columns:
+                t_vals = set(tdf[tcol].dropna().astype(str).head(5000))
+                if not t_vals:
+                    continue
+                name_match = bool(candidate_key_names(tcol) & base_variants)
+                overlap = len(base_vals & t_vals) / max(1, len(base_vals))
+                if overlap < COMPOSITE_KEY_OVERLAP_MIN:
+                    continue
+                if not name_match and len(t_vals) < 100:
+                    continue
+                if overlap > best_ratio:
+                    best_ratio = overlap
+        if best_ratio >= COMPOSITE_KEY_OVERLAP_MIN:
+            candidate_scores[col] = best_ratio
+    ordered = sorted(candidate_scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [col for col, _ in ordered[:4]]
+
+
+def detect_prejoin_pairs(
+    tables: dict[str, pd.DataFrame],
+    base_keys: list[str],
+) -> list[dict[str, Any]]:
+    """Find pairs of related tables (A, B) whose inner join exposes all base_keys via a bridge key."""
+    if len(base_keys) < 2:
+        return []
+    base_key_set = set(base_keys)
+    candidates = [
+        (name, df)
+        for name, df in tables.items()
+        if name not in {"train.csv", "test.csv"} and not name.startswith("__prejoin__")
+    ]
+    specs: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for (a_name, a_df), (b_name, b_df) in combinations(candidates, 2):
+        a_cols = set(a_df.columns)
+        b_cols = set(b_df.columns)
+
+        shared = set()
+        for col in a_cols:
+            for bcol in b_cols:
+                if col == bcol or (candidate_key_names(col) & candidate_key_names(bcol)):
+                    if col in a_df.columns and bcol in b_df.columns:
+                        shared.add((col, bcol))
+
+        for a_bridge, b_bridge in shared:
+            if a_bridge in base_key_set or b_bridge in base_key_set:
+                continue
+            try:
+                a_unique = a_df[a_bridge].dropna().astype(str).unique()
+                b_unique = b_df[b_bridge].dropna().astype(str).unique()
+                if len(a_unique) > 30000:
+                    a_sample = set(pd.Series(a_unique).sample(n=30000, random_state=0))
+                else:
+                    a_sample = set(a_unique)
+                b_full = set(b_unique)
+            except Exception:
+                continue
+            if not a_sample or not b_full:
+                continue
+            overlap_ratio = len(a_sample & b_full) / max(1, len(a_sample))
+            if overlap_ratio < 0.5:
+                continue
+            # Check that the combined schema covers all base keys
+            combined_cols = a_cols | b_cols
+            if not base_key_set.issubset(combined_cols):
+                continue
+            a_stem = a_name.replace(".csv", "")
+            b_stem = b_name.replace(".csv", "")
+            synth_name = f"__prejoin__{a_stem}__{b_stem}"
+            if synth_name in seen_names:
+                continue
+            seen_names.add(synth_name)
+            specs.append(
+                {
+                    "name": synth_name,
+                    "left": a_name,
+                    "right": b_name,
+                    "left_on": a_bridge,
+                    "right_on": b_bridge,
+                    "base_keys": list(base_keys),
+                }
+            )
+            break  # one bridge per pair
+    return specs
+
+
+def _downcast_for_merge(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        series = out[col]
+        if pd.api.types.is_integer_dtype(series):
+            try:
+                out[col] = pd.to_numeric(series, downcast="integer")
+            except Exception:
+                pass
+        elif pd.api.types.is_float_dtype(series):
+            try:
+                out[col] = pd.to_numeric(series, downcast="float")
+            except Exception:
+                pass
+    return out
+
+
+def materialize_prejoins(
+    tables: dict[str, pd.DataFrame],
+    specs: list[dict[str, Any]],
+) -> None:
+    """Mutate `tables` in place, adding the materialized prejoin tables."""
+    for spec in specs:
+        name = spec["name"]
+        if name in tables:
+            continue
+        left_name = spec["left"]
+        right_name = spec["right"]
+        if left_name not in tables or right_name not in tables:
+            continue
+        left_df = tables[left_name]
+        right_df = tables[right_name]
+        left_on = spec["left_on"]
+        right_on = spec["right_on"]
+        base_keys = spec.get("base_keys", [])
+
+        left_keep = [left_on] + [c for c in left_df.columns if c != left_on and (c in base_keys or pd.api.types.is_numeric_dtype(left_df[c]))]
+        right_keep = [right_on] + [c for c in right_df.columns if c != right_on and (c in base_keys or pd.api.types.is_numeric_dtype(right_df[c]))]
+        # Dedupe while preserving order
+        seen_l: set[str] = set()
+        left_cols = [c for c in left_keep if not (c in seen_l or seen_l.add(c))]
+        seen_r: set[str] = set()
+        right_cols = [c for c in right_keep if not (c in seen_r or seen_r.add(c))]
+
+        left_proj = _downcast_for_merge(left_df[left_cols])
+        right_proj = _downcast_for_merge(right_df[right_cols])
+
+        try:
+            if left_on == right_on:
+                merged = left_proj.merge(right_proj, how="inner", on=left_on)
+            else:
+                merged = left_proj.merge(right_proj, how="inner", left_on=left_on, right_on=right_on)
+                if right_on in merged.columns and right_on != left_on:
+                    merged = merged.drop(columns=[right_on])
+        except Exception as exc:
+            logger.warning("Не удалось выполнить prejoin {}: {}", name, exc)
+            continue
+
+        # Verify all base keys survived the merge
+        if not all(bk in merged.columns for bk in base_keys):
+            logger.warning("Prejoin {} не содержит все base_keys {}", name, base_keys)
+            continue
+
+        tables[name] = merged
+        logger.info(
+            "Registered prejoin {}: {} rows, keys={}",
+            name,
+            len(merged),
+            base_keys,
+        )
+
+
 def build_related_table_attempts(
     tables: dict[str, pd.DataFrame],
     base_df: pd.DataFrame,
@@ -641,8 +933,8 @@ def build_related_table_attempts(
     diversity_specs: list[dict[str, Any]] = []
     base_columns = [col for col in base_df.columns if col != target_column]
     base_samples = {
-        col: set(base_df[col].dropna().astype(str).head(2000))
-        for col in base_columns[:20]
+        col: set(base_df[col].dropna().astype(str).head(4000))
+        for col in base_columns[:50]
     }
 
     for table_name, df in tables.items():
@@ -655,7 +947,7 @@ def build_related_table_attempts(
                 score = 0
                 if candidate_key_names(table_key) & base_variant:
                     score += 10
-                sample_overlap = len(base_samples.get(base_key, set()) & set(df[table_key].dropna().astype(str).head(2000)))
+                sample_overlap = len(base_samples.get(base_key, set()) & set(df[table_key].dropna().astype(str).head(4000)))
                 score += min(sample_overlap, 20)
                 if score > 0:
                     join_candidates.append((score, base_key, table_key))
@@ -667,7 +959,7 @@ def build_related_table_attempts(
         is_one_to_one = df[join_key].nunique(dropna=True) >= max(1, int(len(df) * 0.95))
 
         if is_one_to_one:
-            candidate_cols = [col for col in df.columns if col != join_key][:4]
+            candidate_cols = [col for col in df.columns if col != join_key][:10]
             for col in candidate_cols:
                 one_to_one_specs.append(
                     {
@@ -695,8 +987,8 @@ def build_related_table_attempts(
             }
         )
 
-        numeric_cols = [col for col in df.columns if col != join_key and pd.api.types.is_numeric_dtype(df[col])][:3]
-        categorical_cols = [col for col in df.columns if col != join_key and df[col].dtype == "object"][:2]
+        numeric_cols = [col for col in df.columns if col != join_key and pd.api.types.is_numeric_dtype(df[col])][:8]
+        categorical_cols = [col for col in df.columns if col != join_key and _is_string_or_object_dtype(df[col])][:5]
 
         for col in numeric_cols:
             aggregate_specs.append(
@@ -738,11 +1030,193 @@ def build_related_table_attempts(
             )
 
     if one_to_one_specs:
-        attempts.append({"name": "shared_key_firsts", "features": one_to_one_specs[:MAX_FEATURES]})
+        attempts.append({"name": "shared_key_firsts", "features": one_to_one_specs[:POOL_MAX_FEATURES]})
     if aggregate_specs:
-        attempts.append({"name": "shared_key_counts_means", "features": aggregate_specs[:MAX_FEATURES]})
+        attempts.append({"name": "shared_key_counts_means", "features": aggregate_specs[:POOL_MAX_FEATURES]})
     if diversity_specs:
-        attempts.append({"name": "shared_key_sums_nunique", "features": diversity_specs[:MAX_FEATURES]})
+        attempts.append({"name": "shared_key_sums_nunique", "features": diversity_specs[:POOL_MAX_FEATURES]})
+    return attempts
+
+
+def _is_binary_like(series: pd.Series) -> bool:
+    if not pd.api.types.is_numeric_dtype(series):
+        return False
+    vals = set(pd.unique(series.dropna()))
+    if not vals:
+        return False
+    return vals.issubset({0, 1, 0.0, 1.0, True, False})
+
+
+def _is_order_like(series: pd.Series) -> bool:
+    if not pd.api.types.is_integer_dtype(series):
+        return False
+    try:
+        clean = series.dropna()
+        if clean.empty:
+            return False
+        if clean.min() < 0:
+            return False
+        if clean.max() >= 1e5:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def build_pair_feature_attempts(
+    tables: dict[str, pd.DataFrame],
+    base_df: pd.DataFrame,
+    id_column: str,
+    target_column: str,
+    base_keys: list[str],
+) -> list[dict[str, Any]]:
+    """Emit composite-groupby pair-feature attempts on any registered prejoin tables."""
+    if len(base_keys) < 2:
+        return []
+
+    attempts: list[dict[str, Any]] = []
+    for tname, tdf in tables.items():
+        if not tname.startswith("__prejoin__"):
+            continue
+        if not all(bk in tdf.columns for bk in base_keys):
+            continue
+
+        binary_cols: list[str] = []
+        order_cols: list[str] = []
+        generic_numeric_cols: list[str] = []
+        for col in tdf.columns:
+            if col in base_keys:
+                continue
+            series = tdf[col]
+            if not pd.api.types.is_numeric_dtype(series):
+                continue
+            if _is_binary_like(series):
+                binary_cols.append(col)
+            elif _is_order_like(series):
+                order_cols.append(col)
+            else:
+                generic_numeric_cols.append(col)
+
+        # Rank generic numeric by non-null fraction (stable proxy for usefulness).
+        def _non_null_frac(c: str) -> float:
+            return float(tdf[c].notna().mean())
+
+        binary_cols.sort(key=_non_null_frac, reverse=True)
+        order_cols.sort(key=_non_null_frac, reverse=True)
+        generic_numeric_cols.sort(key=_non_null_frac, reverse=True)
+
+        primary_base = base_keys[0]
+
+        def pair_count_spec(name: str = "pair_count") -> dict[str, Any]:
+            return {
+                "name": name,
+                "kind": "aggregate",
+                "table": tname,
+                "group_keys": list(base_keys),
+                "base_keys": list(base_keys),
+                "agg": "count",
+                "value_column": None,
+                "filters": [],
+            }
+
+        def scope_single_count_spec(name: str = "scope_user_count") -> dict[str, Any]:
+            return {
+                "name": name,
+                "kind": "aggregate",
+                "table": tname,
+                "group_keys": [primary_base],
+                "base_keys": [primary_base],
+                "agg": "count",
+                "value_column": None,
+                "filters": [],
+            }
+
+        def pair_value_spec(col: str, agg: str, out: str) -> dict[str, Any]:
+            return {
+                "name": out,
+                "kind": "aggregate",
+                "table": tname,
+                "group_keys": list(base_keys),
+                "base_keys": list(base_keys),
+                "agg": agg,
+                "value_column": col,
+                "filters": [],
+            }
+
+        def scope_value_spec(col: str, agg: str, out: str) -> dict[str, Any]:
+            return {
+                "name": out,
+                "kind": "aggregate",
+                "table": tname,
+                "group_keys": [primary_base],
+                "base_keys": [primary_base],
+                "agg": agg,
+                "value_column": col,
+                "filters": [],
+            }
+
+        def binary_op_spec(op: str, out: str, left: str, right: str) -> dict[str, Any]:
+            return {
+                "name": out,
+                "kind": "binary_op",
+                "op": op,
+                "left": left,
+                "right": right,
+            }
+
+        # pair_core: canonical five
+        core_features: list[dict[str, Any]] = [pair_count_spec("pair_count")]
+        if binary_cols:
+            core_features.append(pair_value_spec(binary_cols[0], "mean", f"pair_{binary_cols[0]}_mean"))
+        if order_cols:
+            oc = order_cols[0]
+            core_features.append(pair_value_spec(oc, "max", f"pair_{oc}_max"))
+            core_features.append(scope_value_spec(oc, "max", f"scope_{primary_base}_{oc}_max"))
+            core_features.append(
+                binary_op_spec("subtract", f"pair_{oc}_since_last", f"scope_{primary_base}_{oc}_max", f"pair_{oc}_max")
+            )
+        if len(core_features) < 5:
+            core_features.append(scope_single_count_spec(f"scope_{primary_base}_count"))
+            core_features.append(binary_op_spec("divide", "pair_frequency", "pair_count", f"scope_{primary_base}_count"))
+
+        # pair_position: emphasize generic numerics / cart-like means
+        position_features: list[dict[str, Any]] = [pair_count_spec("pair_count_p")]
+        for col in generic_numeric_cols[:3]:
+            position_features.append(pair_value_spec(col, "mean", f"pair_{col}_mean"))
+        if binary_cols:
+            position_features.append(pair_value_spec(binary_cols[0], "sum", f"pair_{binary_cols[0]}_sum"))
+        if len(position_features) < 5 and order_cols:
+            position_features.append(pair_value_spec(order_cols[0], "min", f"pair_{order_cols[0]}_min"))
+
+        # pair_recency: emphasize recency / frequency signals
+        recency_features: list[dict[str, Any]] = [pair_count_spec("pair_count_r")]
+        if order_cols:
+            oc = order_cols[0]
+            recency_features.append(pair_value_spec(oc, "max", f"pair_{oc}_max_r"))
+            recency_features.append(scope_value_spec(oc, "max", f"scope_{primary_base}_{oc}_max_r"))
+            recency_features.append(
+                binary_op_spec(
+                    "subtract",
+                    f"pair_{oc}_since_last_r",
+                    f"scope_{primary_base}_{oc}_max_r",
+                    f"pair_{oc}_max_r",
+                )
+            )
+            recency_features.append(pair_value_spec(oc, "min", f"pair_{oc}_min_r"))
+        else:
+            recency_features.append(scope_single_count_spec(f"scope_{primary_base}_count_r"))
+            recency_features.append(
+                binary_op_spec("divide", "pair_frequency_r", "pair_count_r", f"scope_{primary_base}_count_r")
+            )
+
+        for name, feats in (
+            ("pair_core", core_features),
+            ("pair_position", position_features),
+            ("pair_recency", recency_features),
+        ):
+            if len(feats) >= 2:
+                attempts.append({"name": name, "features": feats[:POOL_MAX_FEATURES]})
+
     return attempts
 
 
@@ -750,7 +1224,7 @@ def prepare_model_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[int]]:
     frame = df.copy()
     cat_features: list[int] = []
     for idx, col in enumerate(frame.columns):
-        if frame[col].dtype == "object":
+        if _is_string_or_object_dtype(frame[col]):
             frame[col] = frame[col].fillna("__nan__").astype(str)
             cat_features.append(idx)
         else:
@@ -758,15 +1232,17 @@ def prepare_model_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[int]]:
     return frame, cat_features
 
 
-def maybe_sample_for_eval(df: pd.DataFrame, target_column: str) -> pd.DataFrame:
-    if len(df) <= EVAL_SAMPLE_ROWS:
+def maybe_sample_for_eval(df: pd.DataFrame, target_column: str, sample_rows: int = EVAL_SAMPLE_ROWS) -> pd.DataFrame:
+    if len(df) <= sample_rows:
         return df
-    sampled = (
-        df.groupby(target_column, group_keys=False)
-        .apply(lambda x: x.sample(min(len(x), EVAL_SAMPLE_ROWS // 2), random_state=RANDOM_STATE))
-        .reset_index(drop=True)
-    )
-    return sampled
+    # Use index-based stratified sampling to avoid pandas 3.x groupby().apply()
+    # dropping the grouping column from results.
+    indices: list[int] = []
+    per_class = sample_rows // max(1, df[target_column].nunique())
+    for _, group in df.groupby(target_column, group_keys=False):
+        n = min(len(group), max(1, per_class))
+        indices.extend(group.sample(n=n, random_state=RANDOM_STATE).index.tolist())
+    return df.loc[indices].reset_index(drop=True)
 
 
 def evaluate_attempt(
@@ -776,6 +1252,8 @@ def evaluate_attempt(
     feature_cols: list[str],
     target_column: str,
     id_column: str,
+    *,
+    sample_rows: int = EVAL_SAMPLE_ROWS,
 ) -> AttemptResult | None:
     usable_cols = [col for col in feature_cols if col in train_out.columns and col in test_out.columns]
     if not usable_cols:
@@ -783,8 +1261,7 @@ def evaluate_attempt(
 
     train_frame = train_out.copy()
     test_frame = test_out.copy()
-    reserved = {target_column, id_column}
-    eval_train = maybe_sample_for_eval(train_frame, target_column)
+    eval_train = maybe_sample_for_eval(train_frame, target_column, sample_rows=sample_rows)
 
     X = eval_train[usable_cols].copy()
     y = eval_train[target_column]
@@ -794,20 +1271,26 @@ def evaluate_attempt(
     fold_scores: list[float] = []
     importances = {col: 0.0 for col in usable_cols}
 
-    for train_idx, valid_idx in splitter.split(X_prepared, y):
-        X_train = X_prepared.iloc[train_idx]
-        X_valid = X_prepared.iloc[valid_idx]
-        y_train = y.iloc[train_idx]
-        y_valid = y.iloc[valid_idx]
+    try:
+        for train_idx, valid_idx in splitter.split(X_prepared, y):
+            X_train = X_prepared.iloc[train_idx]
+            X_valid = X_prepared.iloc[valid_idx]
+            y_train = y.iloc[train_idx]
+            y_valid = y.iloc[valid_idx]
 
-        model = CatBoostClassifier(**MODEL_PARAMS)
-        model.fit(X_train, y_train, cat_features=cat_features or None)
-        probs = model.predict_proba(X_valid)[:, 1]
-        fold_scores.append(float(roc_auc_score(y_valid, probs)))
+            model = CatBoostClassifier(**MODEL_PARAMS)
+            model.fit(X_train, y_train, cat_features=cat_features or None)
+            probs = model.predict_proba(X_valid)[:, 1]
+            fold_scores.append(float(roc_auc_score(y_valid, probs)))
 
-        fold_importance = dict(zip(X_prepared.columns, model.get_feature_importance().tolist(), strict=False))
-        for col in usable_cols:
-            importances[col] += float(fold_importance.get(col, 0.0))
+            fold_importance = dict(zip(X_prepared.columns, model.get_feature_importance().tolist(), strict=False))
+            for col in usable_cols:
+                importances[col] += float(fold_importance.get(col, 0.0))
+    except Exception as exc:
+        logger.warning("Attempt {} failed during CV: {}", attempt_name, exc)
+        return None
+    if not fold_scores:
+        return None
 
     mean_auc = float(np.mean(fold_scores))
     importances = {k: v / CV_FOLDS for k, v in importances.items()}
@@ -815,11 +1298,13 @@ def evaluate_attempt(
 
     return AttemptResult(
         name=attempt_name,
-        train_features=train_frame[[id_column, *selected]],
-        test_features=test_frame[[id_column, *selected]],
+        train_features=train_frame[[id_column, *selected]].reset_index(drop=True),
+        test_features=test_frame[[id_column, *selected]].reset_index(drop=True),
         cv_auc=mean_auc,
         selected_features=selected,
         importances=importances,
+        train_pool=train_frame[[id_column, *usable_cols]].reset_index(drop=True),
+        test_pool=test_frame[[id_column, *usable_cols]].reset_index(drop=True),
     )
 
 
@@ -907,6 +1392,108 @@ def attach_feature_frame(base_df: pd.DataFrame, feature_df: pd.DataFrame, id_col
     )
 
 
+def _column_hash(series: pd.Series) -> str:
+    try:
+        values = pd.util.hash_pandas_object(series.reset_index(drop=True), index=False).values
+        return hashlib.md5(values.tobytes()).hexdigest()
+    except Exception:
+        return hashlib.md5(str(series.tolist()).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def pool_and_select_global_features(
+    evaluated: list[AttemptResult],
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    id_column: str,
+    target_column: str,
+) -> AttemptResult | None:
+    """Pool all materialized features from every attempt, CV-select a global top-5."""
+    if not evaluated:
+        return None
+
+    train_pool = pd.DataFrame({id_column: train_df[id_column].reset_index(drop=True)})
+    test_pool = pd.DataFrame({id_column: test_df[id_column].reset_index(drop=True)})
+
+    pre_rank: dict[str, float] = {}
+    seen_hashes: set[str] = set()
+
+    for attempt in evaluated:
+        if attempt.train_pool.empty or attempt.test_pool.empty:
+            continue
+        if id_column not in attempt.train_pool.columns or id_column not in attempt.test_pool.columns:
+            continue
+        for col in attempt.train_pool.columns:
+            if col == id_column:
+                continue
+            if col not in attempt.test_pool.columns:
+                continue
+            pooled_name = f"{attempt.name}__{col}"
+            if pooled_name in train_pool.columns:
+                continue
+            series = attempt.train_pool[col]
+            if pd.api.types.is_numeric_dtype(series):
+                if series.dropna().empty:
+                    continue
+                if series.nunique(dropna=True) <= 1:
+                    continue
+            col_hash = _column_hash(series)
+            if col_hash in seen_hashes:
+                continue
+            seen_hashes.add(col_hash)
+            train_pool[pooled_name] = series.reset_index(drop=True)
+            test_pool[pooled_name] = attempt.test_pool[col].reset_index(drop=True)
+            pre_rank[pooled_name] = float(attempt.importances.get(col, 0.0))
+
+    pooled_cols = [c for c in train_pool.columns if c != id_column]
+    if len(pooled_cols) < MAX_FEATURES:
+        return None
+
+    if len(pooled_cols) > POOL_MAX_FEATURES:
+        ranked = sorted(pooled_cols, key=lambda c: pre_rank.get(c, 0.0), reverse=True)
+        keep = set(ranked[:POOL_MAX_FEATURES])
+        drop_cols = [c for c in pooled_cols if c not in keep]
+        if drop_cols:
+            train_pool = train_pool.drop(columns=drop_cols)
+            test_pool = test_pool.drop(columns=drop_cols)
+        pooled_cols = [c for c in train_pool.columns if c != id_column]
+
+    train_out = attach_feature_frame(train_df, train_pool, id_column)
+    test_out = attach_feature_frame(test_df, test_pool, id_column)
+
+    selection_pass = evaluate_attempt(
+        attempt_name="__pool_select__",
+        train_out=train_out,
+        test_out=test_out,
+        feature_cols=pooled_cols,
+        target_column=target_column,
+        id_column=id_column,
+        sample_rows=POOL_EVAL_SAMPLE_ROWS,
+    )
+    if selection_pass is None or len(selection_pass.selected_features) < MAX_FEATURES:
+        return None
+
+    final_cols = selection_pass.selected_features
+    final_pass = evaluate_attempt(
+        attempt_name="__global_pool__",
+        train_out=train_out,
+        test_out=test_out,
+        feature_cols=final_cols,
+        target_column=target_column,
+        id_column=id_column,
+        sample_rows=EVAL_SAMPLE_ROWS,
+    )
+    if final_pass is None:
+        return None
+    logger.info(
+        "Global pool selection: {} pooled cols -> top {} = {}; final CV AUC {:.5f}",
+        len(pooled_cols),
+        MAX_FEATURES,
+        final_cols,
+        final_pass.cv_auc,
+    )
+    return final_pass
+
+
 def format_output_frames(
     train_source: pd.DataFrame,
     test_source: pd.DataFrame,
@@ -992,6 +1579,14 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
     id_column = infer_id_column(train_df, test_df, target_column)
     logger.info("Определены ключевые колонки: id={}, target={}", id_column, target_column)
 
+    base_concat = pd.concat([train_df, test_df], ignore_index=True)
+    base_keys = detect_base_join_keys(base_concat, tables, id_column, target_column)
+    if base_keys:
+        logger.info("Detected composite base keys: {}", base_keys)
+        prejoin_specs = detect_prejoin_pairs(tables, base_keys)
+        if prejoin_specs:
+            materialize_prejoins(tables, prejoin_specs)
+
     all_attempts: list[dict[str, Any]] = []
     all_attempts.extend(
         llm_generate_attempts(
@@ -1001,14 +1596,24 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
             base_ids=pd.concat([train_df[id_column], test_df[id_column]], ignore_index=True),
             id_column=id_column,
             target_column=target_column,
+            base_keys=base_keys,
         )
     )
     all_attempts.extend(
         build_related_table_attempts(
             tables=tables,
-            base_df=pd.concat([train_df, test_df], ignore_index=True),
+            base_df=base_concat,
             id_column=id_column,
             target_column=target_column,
+        )
+    )
+    all_attempts.extend(
+        build_pair_feature_attempts(
+            tables=tables,
+            base_df=base_concat,
+            id_column=id_column,
+            target_column=target_column,
+            base_keys=base_keys,
         )
     )
 
@@ -1045,12 +1650,25 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
             fallback_result.selected_features,
         )
 
-    if evaluated:
-        best_attempt = max(evaluated, key=lambda item: item.cv_auc)
+    pooled_result = pool_and_select_global_features(
+        evaluated=evaluated,
+        train_df=train_df,
+        test_df=test_df,
+        id_column=id_column,
+        target_column=target_column,
+    )
+
+    candidates = [r for r in [pooled_result, *evaluated] if r is not None]
+    if candidates:
+        best_attempt = max(candidates, key=lambda item: item.cv_auc)
+        best_single = max((r.cv_auc for r in evaluated), default=0.0)
+        pool_auc_str = f"{pooled_result.cv_auc:.5f}" if pooled_result else "n/a"
         logger.info(
-            "Выбрана попытка {} с CV AUC {:.5f}",
+            "Winner: {} (CV AUC {:.5f}); pool={} best_single={:.5f}",
             best_attempt.name,
             best_attempt.cv_auc,
+            pool_auc_str,
+            best_single,
         )
         final_train, final_test = format_output_frames(
             train_source=train_df,
