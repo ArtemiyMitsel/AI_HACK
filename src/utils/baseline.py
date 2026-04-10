@@ -19,7 +19,7 @@ OUTPUT_DIR = Path("output")
 MAX_FEATURES = 5
 MAX_ATTEMPTS = 4
 MAX_LLM_ATTEMPTS = 2
-MAX_LLM_FEATURES_PER_ATTEMPT = 5
+MAX_LLM_FEATURES_PER_ATTEMPT = 8
 CV_FOLDS = 3
 RANDOM_STATE = 42
 EVAL_SAMPLE_ROWS = 20_000
@@ -227,17 +227,21 @@ def llm_generate_attempts(
 - Есть train/test и дополнительные связанные таблицы.
 - Главный ключ базовой сущности: {id_column}
 - Целевая переменная: {target_column}
-- Нужно предложить максимум {MAX_LLM_ATTEMPTS} попытки, максимум {MAX_LLM_FEATURES_PER_ATTEMPT} признаков в каждой попытке.
+- Нужно предложить максимум {MAX_LLM_ATTEMPTS} попытки, максимум {MAX_LLM_FEATURES_PER_ATTEMPT} кандидатов признаков в каждой попытке.
 - Используй только таблицы и колонки, перечисленные ниже.
 - Если таблица не нужна, игнорируй ее.
 - Отдавай только JSON без пояснений.
 
 Поддерживаемый DSL:
-Каждая попытка должна содержать ровно {MAX_FEATURES} итоговых признаков.
+Каждая попытка должна содержать от {MAX_FEATURES} до {MAX_LLM_FEATURES_PER_ATTEMPT} кандидатов, отсортированных от самых сильных к самым слабым.
+Исполнитель попытается материализовать кандидаты по порядку, отберет до {MAX_FEATURES} лучших валидных признаков и при необходимости автоматически дополнит попытку.
 LLM сам решает, сколько из них:
 - взять как уже существующие поля базовой таблицы;
 - построить агрегациями;
 - получить как комбинации ранее созданных признаков.
+- `direct` используй только для колонок, которые уже есть в базовой таблице train/test.
+- Если признак берется из любой другой таблицы (`users.csv`, `products.csv` и т.д.), описывай его как `aggregate` c `agg="first"` и корректными `group_key`/`base_key`.
+- Избегай кандидатов, которые зависят от колонок, отсутствующих в перечисленных таблицах.
 
 1. direct:
 {{
@@ -372,6 +376,43 @@ def choose_base_join_key(base_frame: pd.DataFrame, group_key: str, hinted_base_k
     return None
 
 
+def choose_join_columns(
+    base_frame: pd.DataFrame,
+    table_df: pd.DataFrame,
+    hinted_table_key: Any,
+    hinted_base_key: Any,
+    id_column: str,
+) -> tuple[str | None, str | None]:
+    table_key = normalize_group_key(hinted_table_key, table_df)
+    base_key = normalize_group_key(hinted_base_key, base_frame)
+    if table_key and base_key:
+        return table_key, base_key
+    if table_key:
+        return table_key, choose_base_join_key(base_frame, table_key, hinted_base_key, id_column)
+
+    best_pair: tuple[str, str] | None = None
+    best_score = 0
+    base_samples = {
+        col: set(base_frame[col].dropna().astype(str).head(2000))
+        for col in base_frame.columns
+    }
+    table_samples = {
+        col: set(table_df[col].dropna().astype(str).head(2000))
+        for col in table_df.columns
+    }
+    for base_col in base_frame.columns:
+        base_variants = candidate_key_names(base_col)
+        for table_col in table_df.columns:
+            score = 0
+            if candidate_key_names(table_col) & base_variants:
+                score += 10
+            score += min(len(base_samples[base_col] & table_samples[table_col]), 20)
+            if score > best_score:
+                best_score = score
+                best_pair = (table_col, base_col)
+    return best_pair if best_pair and best_score > 0 else (None, None)
+
+
 def build_aggregate_feature(
     base_frame: pd.DataFrame,
     tables: dict[str, pd.DataFrame],
@@ -461,10 +502,65 @@ def build_binary_feature(feature_frame: pd.DataFrame, spec: dict[str, Any]) -> p
 
 def build_direct_feature(base_frame: pd.DataFrame, spec: dict[str, Any]) -> pd.Series | None:
     column = spec.get("column")
-    if not isinstance(column, str) or column not in base_frame.columns:
+    if not isinstance(column, str):
         logger.warning("Пропускаем direct feature, колонка не найдена: {}", spec)
         return None
-    return base_frame[column].reset_index(drop=True)
+    if column in base_frame.columns:
+        return base_frame[column].reset_index(drop=True)
+    logger.warning("Пропускаем direct feature, колонка не найдена в базовой таблице: {}", spec)
+    return None
+
+
+def build_lookup_direct_feature(
+    base_frame: pd.DataFrame,
+    tables: dict[str, pd.DataFrame],
+    id_column: str,
+    spec: dict[str, Any],
+) -> pd.Series | None:
+    table_name = spec.get("table")
+    column = spec.get("column")
+    if not isinstance(table_name, str) or table_name not in tables or not isinstance(column, str):
+        return None
+
+    table_df = tables[table_name].copy()
+    if column not in table_df.columns:
+        logger.warning("Пропускаем lookup direct feature, колонка не найдена: {}", spec)
+        return None
+
+    table_key, base_key = choose_join_columns(
+        base_frame=base_frame,
+        table_df=table_df,
+        hinted_table_key=spec.get("group_key"),
+        hinted_base_key=spec.get("base_key"),
+        id_column=id_column,
+    )
+    if not table_key or not base_key:
+        logger.warning("Пропускаем lookup direct feature, не удалось подобрать ключи: {}", spec)
+        return None
+
+    lookup = (
+        table_df[[table_key, column]]
+        .dropna(subset=[table_key])
+        .drop_duplicates(subset=[table_key], keep="first")
+        .set_index(table_key)[column]
+    )
+    return base_frame[base_key].map(lookup)
+
+
+def build_completion_feature_specs(
+    base_frame: pd.DataFrame,
+    tables: dict[str, pd.DataFrame],
+    id_column: str,
+    target_column: str,
+) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    base_direct_cols = [col for col in base_frame.columns if col not in {id_column, target_column}]
+    for col in base_direct_cols:
+        specs.append({"name": f"base_{col}", "kind": "direct", "column": col})
+
+    for attempt in build_related_table_attempts(tables, base_frame, id_column, target_column):
+        specs.extend(attempt.get("features", []))
+    return specs
 
 
 def build_features_for_attempt(
@@ -477,7 +573,7 @@ def build_features_for_attempt(
     used_names = set(feature_frame.columns)
     name_map: dict[str, str] = {}
 
-    for feature_spec in attempt.get("features", [])[:MAX_FEATURES]:
+    for feature_spec in attempt.get("features", []):
         if not isinstance(feature_spec, dict):
             logger.warning("Пропускаем невалидный feature spec: {}", feature_spec)
             continue
@@ -488,6 +584,8 @@ def build_features_for_attempt(
         series: pd.Series | None = None
         if kind == "direct":
             series = build_direct_feature(base_frame, feature_spec)
+            if series is None:
+                series = build_lookup_direct_feature(base_frame, tables, id_column, feature_spec)
         elif kind == "aggregate":
             series = build_aggregate_feature(base_frame, tables, base_frame[id_column], id_column, feature_spec)
         elif kind == "binary_op":
@@ -736,18 +834,46 @@ def materialize_attempts(
     base_frame = pd.concat([train_df, test_df], ignore_index=True)
     train_count = len(train_df)
     results: list[AttemptResult] = []
+    completion_specs = build_completion_feature_specs(base_frame, tables, id_column, target_column)
 
     for attempt in attempts[:MAX_ATTEMPTS]:
         feature_frame = build_features_for_attempt(attempt, base_frame, id_column, tables)
         feature_cols = [col for col in feature_frame.columns if col != id_column]
-        if len(feature_cols) != MAX_FEATURES:
+        if len(feature_cols) < MAX_FEATURES:
+            supplemented = build_features_for_attempt(
+                {"name": f"{attempt.get('name', 'attempt')}_completion", "features": completion_specs},
+                base_frame,
+                id_column,
+                tables,
+            )
+            added_cols: list[str] = []
+            for col in supplemented.columns:
+                if col == id_column or col in feature_frame.columns:
+                    continue
+                feature_frame[col] = supplemented[col]
+                added_cols.append(col)
+                if len([name for name in feature_frame.columns if name != id_column]) >= MAX_FEATURES:
+                    break
+            feature_cols = [col for col in feature_frame.columns if col != id_column]
+            if added_cols:
+                logger.info(
+                    "Попытка {} была дополнена признаками {}",
+                    attempt.get("name", "attempt"),
+                    added_cols,
+                )
+        if not feature_cols:
             logger.warning(
-                "Пропускаем попытку {}, потому что после материализации получилось {} признаков вместо {}",
+                "Пропускаем попытку {}, потому что после материализации не осталось валидных признаков",
+                attempt.get("name", "attempt"),
+            )
+            continue
+        if len(feature_cols) < MAX_FEATURES:
+            logger.warning(
+                "Попытка {} после дополнения содержит только {} признаков из {} целевых",
                 attempt.get("name", "attempt"),
                 len(feature_cols),
                 MAX_FEATURES,
             )
-            continue
 
         train_features = feature_frame.iloc[:train_count].reset_index(drop=True)
         test_features = feature_frame.iloc[train_count:].reset_index(drop=True)
