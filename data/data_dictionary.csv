@@ -1,0 +1,37 @@
+table_name,column_name,description,type,allowed_values
+train.csv,row_id,unique identifier of user-product pair,integer,
+train.csv,user_id,unique user identifier,integer,
+train.csv,product_id,unique product identifier,integer,
+train.csv,target,"1 if user buys product in next order, else 0",binary,"0,1"
+test.csv,row_id,unique identifier of user-product pair,integer,
+test.csv,user_id,unique user identifier,integer,
+test.csv,product_id,unique product identifier,integer,
+test_labels.csv,row_id,unique identifier of user-product pair,integer,
+test_labels.csv,target,"hidden label for organizers; 1 if user buys product in next order, else 0",binary,"0,1"
+users.csv,user_id,unique user identifier,integer,
+users.csv,total_orders,total prior orders of user,numeric,
+users.csv,avg_days_between_orders,average days between prior orders,numeric,
+users.csv,avg_basket_size,average number of items per prior order,numeric,
+users.csv,total_distinct_products,number of distinct products purchased in prior orders,numeric,
+users.csv,reordered_share,share of reordered items in prior orders,numeric,
+users.csv,favorite_day_of_week,most frequent order day of week,categorical,0-6
+users.csv,favorite_hour_of_day,most frequent order hour,categorical,0-23
+orders.csv,order_id,unique order identifier,integer,
+orders.csv,user_id,unique user identifier,integer,
+orders.csv,eval_set,dataset split of order,categorical,"prior,train"
+orders.csv,order_number,sequential order number for user,numeric,
+orders.csv,order_dow,day of week of order,categorical,0-6
+orders.csv,order_hour_of_day,hour of day of order,categorical,0-23
+orders.csv,days_since_prior_order,days since previous order,numeric,
+order_items.csv,order_id,unique order identifier,integer,
+order_items.csv,product_id,unique product identifier,integer,
+order_items.csv,add_to_cart_order,position in cart,numeric,
+order_items.csv,reordered,"1 if product was ordered before by user, else 0",binary,"0,1"
+products.csv,product_id,unique product identifier,integer,
+products.csv,product_name,product name,string,
+products.csv,aisle_id,aisle identifier,integer,
+products.csv,department_id,department identifier,integer,
+aisles.csv,aisle_id,aisle identifier,integer,
+aisles.csv,aisle,aisle name,string,
+departments.csv,department_id,department identifier,integer,
+departments.csv,department,department name,string,
