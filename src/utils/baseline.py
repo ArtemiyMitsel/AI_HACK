@@ -28,6 +28,11 @@ EVAL_SAMPLE_ROWS = 20_000
 POOL_EVAL_SAMPLE_ROWS = 15_000
 POOL_MAX_FEATURES = 40
 COMPOSITE_KEY_OVERLAP_MIN = 0.5
+TABLE_PROFILE_MAX_COLUMNS = 30
+RELATED_JOIN_CANDIDATES_PER_TABLE = 2
+ATTEMPT_SELECTION_SHORTLIST = 7
+POOL_SELECTION_SHORTLIST = 9
+TOP_ATTEMPTS_TO_REFINE = 2
 
 MODEL_PARAMS = {
     "iterations": 300,
@@ -40,9 +45,19 @@ MODEL_PARAMS = {
     "eval_metric": "AUC",
     "auto_class_weights": "Balanced",
 }
+SCREEN_MODEL_PARAMS = {
+    **MODEL_PARAMS,
+    "iterations": 180,
+    "learning_rate": 0.07,
+}
+SELECTION_MODEL_PARAMS = {
+    **MODEL_PARAMS,
+    "iterations": 140,
+    "learning_rate": 0.08,
+}
 
 SUPPORTED_AGGS = {"count", "nunique", "sum", "mean", "min", "max", "std", "median", "first"}
-SUPPORTED_BINARY_OPS = {"divide", "subtract", "add"}
+SUPPORTED_BINARY_OPS = {"divide", "subtract", "add", "multiply"}
 
 
 def _is_string_or_object_dtype(series: pd.Series) -> bool:
@@ -106,12 +121,23 @@ def load_data_tables(data_dir: Path) -> dict[str, pd.DataFrame]:
     return tables
 
 
+def _sampled_nunique(series: pd.Series, sample_size: int = 2000) -> int:
+    sample = series.dropna().head(sample_size)
+    if sample.empty:
+        return 0
+    return int(sample.nunique())
+
+
+def _is_binary_candidate(series: pd.Series) -> bool:
+    return _sampled_nunique(series) == 2
+
+
 def infer_target_column(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     readme_text: str = "",
 ) -> str:
-    readme_match = re.search(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*-\s*целевая переменная", readme_text, flags=re.M)
+    readme_match = re.search(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*-\s*целевая переменная", readme_text, flags=re.M | re.I)
     if readme_match:
         candidate = readme_match.group(1)
         if candidate in train_df.columns:
@@ -119,19 +145,30 @@ def infer_target_column(
 
     scored: list[tuple[float, str]] = []
     for col in train_df.columns:
-        series = train_df[col].dropna()
-        nunique = series.nunique()
+        series = train_df[col]
+        nunique = _sampled_nunique(series)
+        unique_ratio = series.nunique(dropna=False) / max(1, len(train_df))
+        missing_ratio = float(series.isna().mean())
+        normalized = normalize_name(col)
         score = 0.0
-        if nunique == 2:
+        if _is_binary_candidate(series):
+            score += 14.0
+        if normalized in {"target", "label", "y", "flag", "default", "badflag", "isdefault"}:
             score += 10.0
-        if normalize_name(col) in {"target", "label", "y", "flag", "default"}:
-            score += 8.0
+        if normalized.startswith("target") or normalized.endswith("target"):
+            score += 4.0
         if nunique <= 5:
             score += 2.0
         if col not in test_df.columns:
-            score += 3.0
-        if train_df[col].nunique(dropna=False) >= max(1, int(len(train_df) * 0.95)):
-            score -= 6.0
+            score += 6.0
+        if unique_ratio >= 0.95:
+            score -= 12.0
+        if nunique <= 1:
+            score -= 20.0
+        if "id" in normalized or normalized.endswith("key"):
+            score -= 8.0
+        if missing_ratio > 0.5:
+            score -= 2.0
         scored.append((score, col))
     if scored:
         best_score, best_col = max(scored)
@@ -147,18 +184,85 @@ def infer_id_column(train_df: pd.DataFrame, test_df: pd.DataFrame, target_column
         score = 0.0
         train_unique = train_df[col].nunique(dropna=False) >= max(1, int(len(train_df) * 0.95))
         test_unique = test_df[col].nunique(dropna=False) >= max(1, int(len(test_df) * 0.95))
+        normalized = normalize_name(col)
+        sampled_cardinality = max(_sampled_nunique(train_df[col]), _sampled_nunique(test_df[col]))
         if train_unique:
-            score += 5.0
+            score += 6.0
         if test_unique:
-            score += 5.0
-        if normalize_name(col) in {"id", "clientid", "customerid", "userid", "applicationid", "requestid"}:
-            score += 5.0
+            score += 6.0
+        if train_unique and test_unique:
+            score += 4.0
+        if normalized in {"id", "clientid", "customerid", "userid", "applicationid", "requestid"}:
+            score += 6.0
+        if normalized.endswith("id") or normalized.startswith("id"):
+            score += 4.0
+        if any(token in normalized for token in {"target", "label", "flag", "default"}):
+            score -= 10.0
+        if any(token in normalized for token in {"date", "time", "timestamp"}):
+            score -= 4.0
+        if sampled_cardinality <= 10 or _is_binary_candidate(train_df[col]) or _is_binary_candidate(test_df[col]):
+            score -= 6.0
+        if float(train_df[col].isna().mean()) > 0.1 or float(test_df[col].isna().mean()) > 0.1:
+            score -= 3.0
         scored.append((score, col))
     if scored:
-        return max(scored)[1]
+        best_score, best_col = max(scored)
+        if best_score > 0:
+            return best_col
     if common_cols:
         return common_cols[0]
     raise ValueError("Не удалось определить id column")
+
+
+def select_profile_columns(
+    df: pd.DataFrame,
+    id_column: str,
+    target_column: str,
+    base_keys: list[str] | None = None,
+    max_columns: int = TABLE_PROFILE_MAX_COLUMNS,
+) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    priority_norm = {normalize_name(id_column), normalize_name(target_column)}
+    priority_norm.update(normalize_name(col) for col in (base_keys or []))
+
+    def add(col: str) -> None:
+        if col in df.columns and col not in seen and len(selected) < max_columns:
+            selected.append(col)
+            seen.add(col)
+
+    for col in df.columns:
+        normalized = normalize_name(col)
+        if normalized in priority_norm or normalized.endswith("id") or normalized.endswith("key"):
+            add(col)
+
+    numeric_cols = [col for col in df.columns if col not in seen and pd.api.types.is_numeric_dtype(df[col])]
+    numeric_cols.sort(
+        key=lambda col: (
+            float(df[col].notna().mean()),
+            min(_sampled_nunique(df[col]), 500),
+        ),
+        reverse=True,
+    )
+    for col in numeric_cols[:10]:
+        add(col)
+
+    def _categorical_score(col: str) -> tuple[float, int]:
+        series = df[col]
+        sampled_nunique = _sampled_nunique(series)
+        medium_cardinality_bonus = 1 if 2 <= sampled_nunique <= 200 else 0
+        return float(series.notna().mean()) + medium_cardinality_bonus, min(sampled_nunique, 500)
+
+    categorical_cols = [col for col in df.columns if col not in seen and _is_string_or_object_dtype(df[col])]
+    categorical_cols.sort(key=_categorical_score, reverse=True)
+    for col in categorical_cols[:10]:
+        add(col)
+
+    for col in df.columns:
+        add(col)
+        if len(selected) >= max_columns:
+            break
+    return selected
 
 
 def build_table_profiles(
@@ -173,7 +277,12 @@ def build_table_profiles(
     base_keys = base_keys or []
     for name, df in tables.items():
         columns: list[dict[str, Any]] = []
-        for col in df.columns[:30]:
+        for col in select_profile_columns(
+            df,
+            id_column=id_column,
+            target_column=target_column,
+            base_keys=base_keys,
+        ):
             series = df[col]
             col_profile: dict[str, Any] = {
                 "name": col,
@@ -612,6 +721,8 @@ def build_binary_feature(feature_frame: pd.DataFrame, spec: dict[str, Any]) -> p
         return left_series - right_series
     if op == "add":
         return left_series + right_series
+    if op == "multiply":
+        return left_series * right_series
     logger.warning("Пропускаем binary_op feature, неподдерживаемая операция: {}", spec)
     return None
 
@@ -668,13 +779,14 @@ def build_completion_feature_specs(
     tables: dict[str, pd.DataFrame],
     id_column: str,
     target_column: str,
+    related_attempts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     base_direct_cols = [col for col in base_frame.columns if col not in {id_column, target_column}]
     for col in base_direct_cols:
         specs.append({"name": f"base_{col}", "kind": "direct", "column": col})
 
-    for attempt in build_related_table_attempts(tables, base_frame, id_column, target_column):
+    for attempt in related_attempts or build_related_table_attempts(tables, base_frame, id_column, target_column):
         specs.extend(attempt.get("features", []))
     return specs
 
@@ -928,9 +1040,9 @@ def build_related_table_attempts(
     target_column: str,
 ) -> list[dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
-    one_to_one_specs: list[dict[str, Any]] = []
-    aggregate_specs: list[dict[str, Any]] = []
-    diversity_specs: list[dict[str, Any]] = []
+    one_to_one_specs: list[tuple[int, dict[str, Any]]] = []
+    aggregate_specs: list[tuple[int, dict[str, Any]]] = []
+    diversity_specs: list[tuple[int, dict[str, Any]]] = []
     base_columns = [col for col in base_df.columns if col != target_column]
     base_samples = {
         col: set(base_df[col].dropna().astype(str).head(4000))
@@ -955,86 +1067,116 @@ def build_related_table_attempts(
         if not join_candidates:
             continue
 
-        _, base_key, join_key = max(join_candidates)
-        is_one_to_one = df[join_key].nunique(dropna=True) >= max(1, int(len(df) * 0.95))
+        selected_join_candidates: list[tuple[int, str, str]] = []
+        seen_join_pairs: set[tuple[str, str]] = set()
+        for score, base_key, join_key in sorted(join_candidates, reverse=True):
+            join_pair = (base_key, join_key)
+            if join_pair in seen_join_pairs:
+                continue
+            seen_join_pairs.add(join_pair)
+            selected_join_candidates.append((score, base_key, join_key))
+            if len(selected_join_candidates) >= RELATED_JOIN_CANDIDATES_PER_TABLE:
+                break
 
-        if is_one_to_one:
-            candidate_cols = [col for col in df.columns if col != join_key][:10]
-            for col in candidate_cols:
-                one_to_one_specs.append(
+        for score, base_key, join_key in selected_join_candidates:
+            feature_prefix = f"{table_name.replace('.csv', '')}_{base_key}_{join_key}"
+            is_one_to_one = df[join_key].nunique(dropna=True) >= max(1, int(len(df) * 0.95))
+
+            if is_one_to_one:
+                candidate_cols = [col for col in df.columns if col != join_key][:10]
+                for col in candidate_cols:
+                    one_to_one_specs.append(
+                        (
+                            score,
+                            {
+                                "name": f"{feature_prefix}_{col}_first",
+                                "kind": "aggregate",
+                                "table": table_name,
+                                "group_key": join_key,
+                                "base_key": base_key,
+                                "value_column": col,
+                                "agg": "first",
+                                "filters": [],
+                            },
+                        )
+                    )
+
+            aggregate_specs.append(
+                (
+                    score,
                     {
-                        "name": f"{table_name.replace('.csv', '')}_{col}_first",
+                        "name": f"{feature_prefix}_count",
                         "kind": "aggregate",
                         "table": table_name,
                         "group_key": join_key,
                         "base_key": base_key,
-                        "value_column": col,
-                        "agg": "first",
+                        "value_column": None,
+                        "agg": "count",
                         "filters": [],
-                    }
+                    },
+                )
+            )
+
+            numeric_cols = [col for col in df.columns if col != join_key and pd.api.types.is_numeric_dtype(df[col])][:8]
+            categorical_cols = [col for col in df.columns if col != join_key and _is_string_or_object_dtype(df[col])][:5]
+
+            for col in numeric_cols:
+                aggregate_specs.append(
+                    (
+                        score,
+                        {
+                            "name": f"{feature_prefix}_{col}_mean",
+                            "kind": "aggregate",
+                            "table": table_name,
+                            "group_key": join_key,
+                            "base_key": base_key,
+                            "value_column": col,
+                            "agg": "mean",
+                            "filters": [],
+                        },
+                    )
+                )
+                diversity_specs.append(
+                    (
+                        score,
+                        {
+                            "name": f"{feature_prefix}_{col}_sum",
+                            "kind": "aggregate",
+                            "table": table_name,
+                            "group_key": join_key,
+                            "base_key": base_key,
+                            "value_column": col,
+                            "agg": "sum",
+                            "filters": [],
+                        },
+                    )
+                )
+            for col in categorical_cols:
+                diversity_specs.append(
+                    (
+                        score,
+                        {
+                            "name": f"{feature_prefix}_{col}_nunique",
+                            "kind": "aggregate",
+                            "table": table_name,
+                            "group_key": join_key,
+                            "base_key": base_key,
+                            "value_column": col,
+                            "agg": "nunique",
+                            "filters": [],
+                        },
+                    )
                 )
 
-        aggregate_specs.append(
-            {
-                "name": f"{table_name.replace('.csv', '')}_{join_key}_count",
-                "kind": "aggregate",
-                "table": table_name,
-                "group_key": join_key,
-                "base_key": base_key,
-                "value_column": None,
-                "agg": "count",
-                "filters": [],
-            }
-        )
-
-        numeric_cols = [col for col in df.columns if col != join_key and pd.api.types.is_numeric_dtype(df[col])][:8]
-        categorical_cols = [col for col in df.columns if col != join_key and _is_string_or_object_dtype(df[col])][:5]
-
-        for col in numeric_cols:
-            aggregate_specs.append(
-                {
-                    "name": f"{table_name.replace('.csv', '')}_{col}_mean",
-                    "kind": "aggregate",
-                    "table": table_name,
-                    "group_key": join_key,
-                    "base_key": base_key,
-                    "value_column": col,
-                    "agg": "mean",
-                    "filters": [],
-                }
-            )
-            diversity_specs.append(
-                {
-                    "name": f"{table_name.replace('.csv', '')}_{col}_sum",
-                    "kind": "aggregate",
-                    "table": table_name,
-                    "group_key": join_key,
-                    "base_key": base_key,
-                    "value_column": col,
-                    "agg": "sum",
-                    "filters": [],
-                }
-            )
-        for col in categorical_cols:
-            diversity_specs.append(
-                {
-                    "name": f"{table_name.replace('.csv', '')}_{col}_nunique",
-                    "kind": "aggregate",
-                    "table": table_name,
-                    "group_key": join_key,
-                    "base_key": base_key,
-                    "value_column": col,
-                    "agg": "nunique",
-                    "filters": [],
-                }
-            )
-
     if one_to_one_specs:
-        attempts.append({"name": "shared_key_firsts", "features": one_to_one_specs[:POOL_MAX_FEATURES]})
+        ranked_specs = [spec for _, spec in sorted(one_to_one_specs, key=lambda item: item[0], reverse=True)]
+        attempts.append({"name": "shared_key_firsts", "features": ranked_specs[:POOL_MAX_FEATURES]})
     if aggregate_specs:
-        attempts.append({"name": "shared_key_counts_means", "features": aggregate_specs[:POOL_MAX_FEATURES]})
+        ranked_specs = [spec for _, spec in sorted(aggregate_specs, key=lambda item: item[0], reverse=True)]
+        attempts.append({"name": "shared_key_counts_means", "features": ranked_specs[:POOL_MAX_FEATURES]})
     if diversity_specs:
-        attempts.append({"name": "shared_key_sums_nunique", "features": diversity_specs[:POOL_MAX_FEATURES]})
+        ranked_specs = [spec for _, spec in sorted(diversity_specs, key=lambda item: item[0], reverse=True)]
+        attempts.append({"name": "shared_key_sums_nunique", "features": ranked_specs[:POOL_MAX_FEATURES]})
     return attempts
 
 
@@ -1242,7 +1384,121 @@ def maybe_sample_for_eval(df: pd.DataFrame, target_column: str, sample_rows: int
     for _, group in df.groupby(target_column, group_keys=False):
         n = min(len(group), max(1, per_class))
         indices.extend(group.sample(n=n, random_state=RANDOM_STATE).index.tolist())
+    if len(indices) < sample_rows:
+        extra_pool = df.drop(index=indices)
+        extra_n = min(len(extra_pool), sample_rows - len(indices))
+        if extra_n > 0:
+            indices.extend(extra_pool.sample(n=extra_n, random_state=RANDOM_STATE).index.tolist())
     return df.loc[indices].reset_index(drop=True)
+
+
+def build_cv_splits(y: pd.Series) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    class_counts = y.value_counts(dropna=False)
+    if len(class_counts) < 2:
+        return None
+    min_class_count = int(class_counts.min())
+    n_splits = min(CV_FOLDS, min_class_count)
+    if n_splits < 2:
+        return None
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    return list(splitter.split(np.zeros(len(y)), y))
+
+
+def mean_cv_auc_for_features(
+    X_prepared: pd.DataFrame,
+    y: pd.Series,
+    feature_cols: list[str],
+    categorical_cols: set[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    model_params: dict[str, Any],
+) -> float | None:
+    if not feature_cols:
+        return None
+    subset_cat_features = [idx for idx, col in enumerate(feature_cols) if col in categorical_cols]
+    fold_scores: list[float] = []
+    for train_idx, valid_idx in splits:
+        X_train = X_prepared.iloc[train_idx][feature_cols]
+        X_valid = X_prepared.iloc[valid_idx][feature_cols]
+        y_train = y.iloc[train_idx]
+        y_valid = y.iloc[valid_idx]
+        model = CatBoostClassifier(**model_params)
+        model.fit(X_train, y_train, cat_features=subset_cat_features or None)
+        probs = model.predict_proba(X_valid)[:, 1]
+        fold_scores.append(float(roc_auc_score(y_valid, probs)))
+    if not fold_scores:
+        return None
+    return float(np.mean(fold_scores))
+
+
+def choose_feature_subset_by_auc(
+    attempt_name: str,
+    train_frame: pd.DataFrame,
+    feature_cols: list[str],
+    target_column: str,
+    *,
+    sample_rows: int,
+    pre_rank: dict[str, float] | None = None,
+    shortlist_size: int = ATTEMPT_SELECTION_SHORTLIST,
+    model_params: dict[str, Any] | None = None,
+) -> list[str]:
+    usable_cols = [col for col in feature_cols if col in train_frame.columns]
+    if len(usable_cols) <= MAX_FEATURES:
+        return usable_cols
+
+    ranked_cols = sorted(
+        usable_cols,
+        key=lambda col: ((pre_rank or {}).get(col, 0.0), col),
+        reverse=True,
+    )
+    shortlist = ranked_cols[: max(MAX_FEATURES, shortlist_size)]
+    eval_train = maybe_sample_for_eval(train_frame, target_column, sample_rows=sample_rows)
+    X = eval_train[shortlist].copy()
+    y = eval_train[target_column]
+    X_prepared, cat_features = prepare_model_frame(X)
+    splits = build_cv_splits(y)
+    if splits is None:
+        return shortlist[:MAX_FEATURES]
+
+    categorical_cols = {X_prepared.columns[idx] for idx in cat_features}
+    selection_model_params = model_params or SELECTION_MODEL_PARAMS
+    selected: list[str] = []
+    remaining = shortlist.copy()
+
+    while remaining and len(selected) < MAX_FEATURES:
+        best_col: str | None = None
+        best_score = float("-inf")
+        for col in remaining:
+            candidate_cols = [*selected, col]
+            candidate_score = mean_cv_auc_for_features(
+                X_prepared,
+                y,
+                candidate_cols,
+                categorical_cols,
+                splits,
+                selection_model_params,
+            )
+            if candidate_score is None:
+                continue
+            candidate_rank = (pre_rank or {}).get(col, 0.0)
+            best_rank = (pre_rank or {}).get(best_col, float("-inf")) if best_col else float("-inf")
+            if candidate_score > best_score + 1e-9 or (
+                abs(candidate_score - best_score) <= 1e-9 and candidate_rank > best_rank
+            ):
+                best_col = col
+                best_score = candidate_score
+        if best_col is None:
+            break
+        selected.append(best_col)
+        remaining.remove(best_col)
+
+    for col in shortlist:
+        if col not in selected:
+            selected.append(col)
+        if len(selected) >= MAX_FEATURES:
+            break
+
+    logger.info("AUC-driven feature selection for {} -> {}", attempt_name, selected[:MAX_FEATURES])
+    return selected[:MAX_FEATURES]
 
 
 def evaluate_attempt(
@@ -1254,6 +1510,7 @@ def evaluate_attempt(
     id_column: str,
     *,
     sample_rows: int = EVAL_SAMPLE_ROWS,
+    model_params: dict[str, Any] | None = None,
 ) -> AttemptResult | None:
     usable_cols = [col for col in feature_cols if col in train_out.columns and col in test_out.columns]
     if not usable_cols:
@@ -1267,18 +1524,23 @@ def evaluate_attempt(
     y = eval_train[target_column]
     X_prepared, cat_features = prepare_model_frame(X)
 
-    splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    splits = build_cv_splits(y)
+    if splits is None:
+        logger.warning("Attempt {} skipped: not enough class diversity for CV", attempt_name)
+        return None
+
+    current_model_params = model_params or SCREEN_MODEL_PARAMS
     fold_scores: list[float] = []
     importances = {col: 0.0 for col in usable_cols}
 
     try:
-        for train_idx, valid_idx in splitter.split(X_prepared, y):
+        for train_idx, valid_idx in splits:
             X_train = X_prepared.iloc[train_idx]
             X_valid = X_prepared.iloc[valid_idx]
             y_train = y.iloc[train_idx]
             y_valid = y.iloc[valid_idx]
 
-            model = CatBoostClassifier(**MODEL_PARAMS)
+            model = CatBoostClassifier(**current_model_params)
             model.fit(X_train, y_train, cat_features=cat_features or None)
             probs = model.predict_proba(X_valid)[:, 1]
             fold_scores.append(float(roc_auc_score(y_valid, probs)))
@@ -1293,8 +1555,11 @@ def evaluate_attempt(
         return None
 
     mean_auc = float(np.mean(fold_scores))
-    importances = {k: v / CV_FOLDS for k, v in importances.items()}
-    selected = [name for name, _ in sorted(importances.items(), key=lambda x: x[1], reverse=True)[:MAX_FEATURES]]
+    importances = {k: v / len(fold_scores) for k, v in importances.items()}
+    if len(usable_cols) <= MAX_FEATURES:
+        selected = usable_cols
+    else:
+        selected = [name for name, _ in sorted(importances.items(), key=lambda x: x[1], reverse=True)[:MAX_FEATURES]]
 
     return AttemptResult(
         name=attempt_name,
@@ -1315,11 +1580,13 @@ def materialize_attempts(
     attempts: list[dict[str, Any]],
     id_column: str,
     target_column: str,
+    completion_specs: list[dict[str, Any]] | None = None,
 ) -> list[AttemptResult]:
     base_frame = pd.concat([train_df, test_df], ignore_index=True)
     train_count = len(train_df)
     results: list[AttemptResult] = []
-    completion_specs = build_completion_feature_specs(base_frame, tables, id_column, target_column)
+    if completion_specs is None:
+        completion_specs = build_completion_feature_specs(base_frame, tables, id_column, target_column)
 
     for attempt in attempts[:MAX_ATTEMPTS]:
         feature_frame = build_features_for_attempt(attempt, base_frame, id_column, tables)
@@ -1383,6 +1650,43 @@ def materialize_attempts(
             )
 
     return results
+
+
+def refine_attempt_result(
+    attempt: AttemptResult,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    id_column: str,
+    target_column: str,
+    *,
+    sample_rows: int = EVAL_SAMPLE_ROWS,
+    shortlist_size: int = ATTEMPT_SELECTION_SHORTLIST,
+) -> AttemptResult | None:
+    pool_cols = [col for col in attempt.train_pool.columns if col != id_column and col in attempt.test_pool.columns]
+    if not pool_cols:
+        return None
+
+    train_out = attach_feature_frame(train_df, attempt.train_pool, id_column)
+    test_out = attach_feature_frame(test_df, attempt.test_pool, id_column)
+    selected_cols = choose_feature_subset_by_auc(
+        attempt.name,
+        train_out,
+        pool_cols,
+        target_column,
+        sample_rows=sample_rows,
+        pre_rank=attempt.importances,
+        shortlist_size=shortlist_size,
+    )
+    return evaluate_attempt(
+        attempt_name=attempt.name,
+        train_out=train_out,
+        test_out=test_out,
+        feature_cols=selected_cols,
+        target_column=target_column,
+        id_column=id_column,
+        sample_rows=sample_rows,
+        model_params=MODEL_PARAMS,
+    )
 
 
 def attach_feature_frame(base_df: pd.DataFrame, feature_df: pd.DataFrame, id_column: str) -> pd.DataFrame:
@@ -1468,11 +1772,22 @@ def pool_and_select_global_features(
         target_column=target_column,
         id_column=id_column,
         sample_rows=POOL_EVAL_SAMPLE_ROWS,
+        model_params=SCREEN_MODEL_PARAMS,
     )
-    if selection_pass is None or len(selection_pass.selected_features) < MAX_FEATURES:
+    if selection_pass is None:
         return None
 
-    final_cols = selection_pass.selected_features
+    final_cols = choose_feature_subset_by_auc(
+        "__global_pool__",
+        train_out,
+        pooled_cols,
+        target_column,
+        sample_rows=POOL_EVAL_SAMPLE_ROWS,
+        pre_rank=selection_pass.importances,
+        shortlist_size=POOL_SELECTION_SHORTLIST,
+    )
+    if len(final_cols) < MAX_FEATURES:
+        return None
     final_pass = evaluate_attempt(
         attempt_name="__global_pool__",
         train_out=train_out,
@@ -1481,6 +1796,7 @@ def pool_and_select_global_features(
         target_column=target_column,
         id_column=id_column,
         sample_rows=EVAL_SAMPLE_ROWS,
+        model_params=MODEL_PARAMS,
     )
     if final_pass is None:
         return None
@@ -1587,6 +1903,20 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
         if prejoin_specs:
             materialize_prejoins(tables, prejoin_specs)
 
+    related_attempts = build_related_table_attempts(
+        tables=tables,
+        base_df=base_concat,
+        id_column=id_column,
+        target_column=target_column,
+    )
+    completion_specs = build_completion_feature_specs(
+        base_frame=base_concat,
+        tables=tables,
+        id_column=id_column,
+        target_column=target_column,
+        related_attempts=related_attempts,
+    )
+
     all_attempts: list[dict[str, Any]] = []
     all_attempts.extend(
         llm_generate_attempts(
@@ -1599,14 +1929,7 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
             base_keys=base_keys,
         )
     )
-    all_attempts.extend(
-        build_related_table_attempts(
-            tables=tables,
-            base_df=base_concat,
-            id_column=id_column,
-            target_column=target_column,
-        )
-    )
+    all_attempts.extend(related_attempts)
     all_attempts.extend(
         build_pair_feature_attempts(
             tables=tables,
@@ -1624,6 +1947,7 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
         attempts=all_attempts,
         id_column=id_column,
         target_column=target_column,
+        completion_specs=completion_specs,
     )
 
     fallback_train, fallback_test = build_fallback_row_features(
@@ -1658,10 +1982,23 @@ def make_agent_submission(gigachat: Any | None = None) -> None:
         target_column=target_column,
     )
 
-    candidates = [r for r in [pooled_result, *evaluated] if r is not None]
+    final_evaluated: list[AttemptResult] = []
+    for attempt in sorted(evaluated, key=lambda item: item.cv_auc, reverse=True)[:TOP_ATTEMPTS_TO_REFINE]:
+        refined = refine_attempt_result(
+            attempt,
+            train_df=train_df,
+            test_df=test_df,
+            id_column=id_column,
+            target_column=target_column,
+        )
+        final_evaluated.append(refined or attempt)
+
+    candidates = [r for r in [pooled_result, *final_evaluated] if r is not None]
+    if not candidates:
+        candidates = [r for r in [pooled_result, *evaluated] if r is not None]
     if candidates:
         best_attempt = max(candidates, key=lambda item: item.cv_auc)
-        best_single = max((r.cv_auc for r in evaluated), default=0.0)
+        best_single = max((r.cv_auc for r in final_evaluated), default=0.0)
         pool_auc_str = f"{pooled_result.cv_auc:.5f}" if pooled_result else "n/a"
         logger.info(
             "Winner: {} (CV AUC {:.5f}); pool={} best_single={:.5f}",
