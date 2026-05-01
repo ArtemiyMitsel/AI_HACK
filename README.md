@@ -10,7 +10,7 @@ You need to implement an **AI agent** powered by [GigaChat-2-Max](https://develo
 - saves the generated features for all samples in the `train` and `test` datasets.
 
 The primary goal of the task is to **demonstrate that your agent can independently devise and validate useful features** for a boosting model.
-
+ 
 ---
 
 ### What to Understand From the Start
